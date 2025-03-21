@@ -5,7 +5,7 @@ Fonctionnalités :
 - Capture de tout le trafic réseau (mode promiscuité)
 - ARP poisoning pour les réseaux commutés
 - Analyse en temps réel (HTTP, DNS, etc.)
-- Gestion des erreurs professionnelle
+- Gestion des erreurs
 - Nettoyage automatique des règles réseau
 """
 
